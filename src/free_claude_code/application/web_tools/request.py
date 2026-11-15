@@ -107,17 +107,23 @@ def plan_automatic_web_search(
 ) -> AutomaticWebSearchPlan | None:
     """Translate only Claude Code's server-tool-only automatic WebSearch request."""
     choice = request.tool_choice
-    if choice is not None and choice != {"type": "auto"}:
+    if choice is not None and choice not in ({"type": "auto"}, {"type": "any"}):
         return None
 
     tools = request.tools or []
     server_tools = [tool for tool in tools if is_anthropic_server_tool_definition(tool)]
     if not server_tools:
         return None
-    if len(tools) != 1 or len(server_tools) != 1:
+    # Middlewares in front of Claude Code (e.g. Headroom) inject plain
+    # function tools such as headroom_retrieve into every request, including
+    # this one, so allow extra non-server tools; they are dropped by the
+    # translation below. Requests listing more than one server-tool
+    # definition still fall through to the unsupported-shape error.
+    search_tools = [tool for tool in server_tools if tool.type == WEB_SEARCH_TYPE]
+    if len(server_tools) != 1 or len(search_tools) != 1:
         return None
 
-    tool = server_tools[0]
+    tool = search_tools[0]
     if tool.type != WEB_SEARCH_TYPE:
         return None
     if not web_tools_enabled:
@@ -164,9 +170,13 @@ def plan_automatic_web_search(
             "additionalProperties": False,
         },
     )
+    translated_choice = (
+        {"type": "auto"} if choice == {"type": "any"} else choice
+    )
     translated = request.model_copy(
         update={
             "tools": [hidden_tool],
+            "tool_choice": translated_choice,
             "messages": _normalized_search_history(request.messages),
         },
         deep=True,
@@ -219,12 +229,15 @@ def _normalized_search_history(messages: list[Message]) -> list[Message]:
 
         uses: dict[str, ContentBlockServerToolUse] = {}
         results: dict[str, ContentBlockWebSearchToolResult] = {}
+        has_search_blocks = False
         for block in content:
             if isinstance(block, ContentBlockServerToolUse):
+                if block.name != "web_search":
+                    continue
+                has_search_blocks = True
                 query = block.input.get("query")
                 if (
-                    block.name != "web_search"
-                    or not block.id
+                    not block.id
                     or block.id in uses
                     or set(block.input) != {"query"}
                     or not isinstance(query, str)
@@ -233,20 +246,36 @@ def _normalized_search_history(messages: list[Message]) -> list[Message]:
                     raise InvalidRequestError(_INCOMPLETE_HISTORY)
                 uses[block.id] = block
             elif isinstance(block, ContentBlockWebSearchToolResult):
+                has_search_blocks = True
                 if not block.tool_use_id or block.tool_use_id in results:
                     raise InvalidRequestError(_INCOMPLETE_HISTORY)
                 results[block.tool_use_id] = block
-            elif getattr(block, "type", None) in _SERVER_HISTORY_TYPES:
-                raise InvalidRequestError(_INCOMPLETE_HISTORY)
-        if not uses or uses.keys() != results.keys():
+        if has_search_blocks and (not uses or uses.keys() != results.keys()):
             raise InvalidRequestError(_INCOMPLETE_HISTORY)
 
         projected = []
         for block in content:
-            if isinstance(block, ContentBlockServerToolUse):
-                projected.append(_search_history_text(block, results[block.id]))
-            elif not isinstance(block, ContentBlockWebSearchToolResult):
+            block_type = getattr(block, "type", None)
+            if block_type not in _SERVER_HISTORY_TYPES:
                 projected.append(block)
+            elif (
+                isinstance(block, ContentBlockServerToolUse)
+                and block.name == "web_search"
+            ):
+                projected.append(_search_history_text(block, results[block.id]))
+            elif block_type == "web_search_tool_result":
+                # already projected alongside its server_tool_use block
+                continue
+            else:
+                # web_fetch calls/results and any other non-search server-tool
+                # history are quoted as plain text so they cannot block the
+                # search and cannot leak unsupported blocks upstream.
+                projected.append(
+                    ContentBlockText(
+                        type="text",
+                        text="[Earlier non-search server tool data omitted]",
+                    )
+                )
         normalized.append(message.model_copy(update={"content": projected}, deep=True))
     return normalized
 
